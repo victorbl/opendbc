@@ -122,6 +122,11 @@ class CarState(CarStateBase):
           button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise))
         self.right_button_scroll = cur_scroll
 
+        # Stalk engage -> synthetic decelCruise to trigger buttonEnable via update_button_enable
+        # Uses decelCruise (not accelCruise) to avoid resumeBlocked NO_ENTRY when vCruise is UNSET
+        if ret.cruiseState.enabled and not self.cruise_enabled_prev:
+          button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.decelCruise))
+
         # Stalk disengage -> cancel (falling edge of cruiseState.enabled)
         if not ret.cruiseState.enabled and self.cruise_enabled_prev:
           button_events.append(structs.CarState.ButtonEvent(pressed=True, type=ButtonType.cancel))
