@@ -38,7 +38,7 @@ class CarInterface(CarInterfaceBase):
 
     if alpha_long and ret.alphaLongitudinalAvailable:
       ret.openpilotLongitudinalControl = True
-      ret.pcmCruise = False
+      ret.pcmCruise = True
       ret.safetyConfigs[0].safetyParam |= RivianSafetyFlags.LONG_CONTROL.value
 
     ret.longitudinalActuatorDelay = 0.35
