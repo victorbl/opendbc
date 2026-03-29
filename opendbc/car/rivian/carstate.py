@@ -17,7 +17,7 @@ class CarState(CarStateBase):
 
     self.acm_lka_hba_cmd: dict | None = None
     self.sccm_wheel_touch: dict | None = None
-    self.vdm_adas_status: list[dict] | None = None
+    self.vdm_adas_status: dict | None = None
 
     # Wheel button state tracking (harness upgrade)
     self.right_button_right_click = 0
@@ -93,9 +93,7 @@ class CarState(CarStateBase):
     self.acm_lka_hba_cmd = copy.copy(cp_cam.vl["ACM_lkaHbaCmd"])
     self.sccm_wheel_touch = copy.copy(cp.vl["SCCM_WheelTouch"])
 
-    # This message can lag and send two messages at once, make sure we forward all of them
-    adas_status_msgs = cp.vl_all["VDM_AdasSts"]
-    self.vdm_adas_status = [dict(zip(adas_status_msgs, vals, strict=True)) for vals in zip(*adas_status_msgs.values(), strict=True)]
+    self.vdm_adas_status = copy.copy(cp.vl["VDM_AdasSts"])
 
     # Button events and BSM (harness upgrade)
     button_events = []
