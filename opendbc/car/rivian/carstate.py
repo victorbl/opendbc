@@ -1,9 +1,11 @@
 import copy
 from opendbc.can import CANParser
-from opendbc.car import Bus, structs
+from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.rivian.values import DBC, GEAR_MAP, RivianFlags
 from opendbc.car.common.conversions import Conversions as CV
+
+ButtonType = structs.CarState.ButtonEvent.Type
 
 GearShifter = structs.CarState.GearShifter
 
@@ -16,6 +18,12 @@ class CarState(CarStateBase):
     self.acm_lka_hba_cmd: dict | None = None
     self.sccm_wheel_touch: dict | None = None
     self.vdm_adas_status: list[dict] | None = None
+
+    # Wheel button state tracking (harness upgrade)
+    self.right_button_right_click = 0
+    self.right_button_left_click = 0
+    self.right_button_scroll = 255  # 255 = idle
+    self.cruise_enabled_prev = False
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -51,8 +59,6 @@ class CarState(CarStateBase):
     ret.cruiseState.enabled = cp_cam.vl["ACM_Status"]["ACM_FeatureStatus"] == 1
     # TODO: find cruise set speed on CAN
     ret.cruiseState.speed = self.last_speed * CV.MPH_TO_MS  # detected speed limit
-    if not self.CP.openpilotLongitudinalControl:
-      ret.cruiseState.speed = -1
     ret.cruiseState.available = True  # cp.vl["VDM_AdasSts"]["VDM_AdasInterfaceStatus"] == 1
     ret.cruiseState.standstill = cp.vl["VDM_AdasSts"]["VDM_AdasVehicleHoldStatus"] == 1
 
@@ -82,9 +88,6 @@ class CarState(CarStateBase):
     ret.leftBlinker = cp_adas.vl["IndicatorLights"]["TurnLightLeft"] in (1, 2)
     ret.rightBlinker = cp_adas.vl["IndicatorLights"]["TurnLightRight"] in (1, 2)
 
-    # Blindspot
-    # ret.leftBlindspot = False
-    # ret.rightBlindspot = False
 
     # AEB
     ret.stockAeb = cp_cam.vl["ACM_AebRequest"]["ACM_EnableRequest"] != 0
@@ -97,12 +100,49 @@ class CarState(CarStateBase):
     adas_status_msgs = cp.vl_all["VDM_AdasSts"]
     self.vdm_adas_status = [dict(zip(adas_status_msgs, vals, strict=True)) for vals in zip(*adas_status_msgs.values(), strict=True)]
 
+    # Button events and BSM (harness upgrade)
+    button_events = []
+    if self.CP.flags & RivianFlags.HARNESS_UPGRADE:
+      cp_park = can_parsers[Bus.alt]
+
+      if self.CP.openpilotLongitudinalControl:
+        # Right wheel buttons -> accelCruise / decelCruise for VCruiseHelper
+        prev_right = self.right_button_right_click
+        prev_left = self.right_button_left_click
+        self.right_button_right_click = cp_park.vl["WheelButtons_Fwd"]["RightButton_RightClick"]
+        self.right_button_left_click = cp_park.vl["WheelButtons_Fwd"]["RightButton_LeftClick"]
+        button_events = [
+          *create_button_events(self.right_button_right_click, prev_right, {2: ButtonType.accelCruise}),
+          *create_button_events(self.right_button_left_click, prev_left, {2: ButtonType.decelCruise}),
+        ]
+
+        # Scroll wheel -> gapAdjustCruise (selfdrived cycles personality on falling edge)
+        cur_scroll = cp_park.vl["WheelButtons_Fwd"]["RightButton_Scroll"]
+        if cur_scroll != 255 and self.right_button_scroll != 255 and cur_scroll != self.right_button_scroll:
+          button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise))
+        self.right_button_scroll = cur_scroll
+
+        # Stalk disengage -> cancel (falling edge of cruiseState.enabled)
+        if not ret.cruiseState.enabled and self.cruise_enabled_prev:
+          button_events.append(structs.CarState.ButtonEvent(pressed=True, type=ButtonType.cancel))
+        self.cruise_enabled_prev = ret.cruiseState.enabled
+
+      # BSM from park assist bus
+      if self.CP.enableBsm:
+        ret.leftBlindspot = cp_park.vl["BSM_BlindSpotIndicator_Fwd"]["BSM_BlindSpotIndicator_Left"] != 0
+        ret.rightBlindspot = cp_park.vl["BSM_BlindSpotIndicator_Fwd"]["BSM_BlindSpotIndicator_Right"] != 0
+
+    ret.buttonEvents = button_events
+
     return ret
 
   @staticmethod
   def get_can_parsers(CP):
-    return {
+    parsers = {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
       Bus.adas: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 1),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
     }
+    if CP.flags & RivianFlags.HARNESS_UPGRADE:
+      parsers[Bus.alt] = CANParser(DBC[CP.carFingerprint][Bus.alt], [], 1)
+    return parsers
