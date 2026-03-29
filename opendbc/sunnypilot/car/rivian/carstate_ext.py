@@ -12,6 +12,7 @@ from opendbc.can.parser import CANParser
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.rivian.values import DBC
 from opendbc.sunnypilot.car.rivian.values import RivianFlagsSP
+from openpilot.common.params import Params
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
@@ -24,6 +25,7 @@ class CarStateExt:
     self.CP = CP
     self.CP_SP = CP_SP
 
+    self.params = Params()
     self.set_speed = 10
     self.increase_button = False
     self.decrease_button = False
@@ -41,10 +43,25 @@ class CarStateExt:
     prev_decrease_button = self.decrease_button
 
     if self.CP.openpilotLongitudinalControl:
-      # distance scroll wheel
+      # distance scroll wheel — detect direction and adjust FollowGap param
       right_scroll = cp_park.vl["WheelButtons_Fwd"]["RightButton_Scroll"]
       if right_scroll != 255:
         if self.distance_button != right_scroll:
+          # Determine scroll direction (higher value = scroll up = farther, lower = scroll down = closer)
+          # Handle wrap-around: scroll values are 0-254
+          diff = right_scroll - self.distance_button
+          if diff > 127:
+            diff -= 255
+          elif diff < -127:
+            diff += 255
+
+          follow_gap = int(self.params.get("FollowGap", return_default=True))
+          if diff > 0:
+            follow_gap = min(follow_gap + 10, 300)
+          else:
+            follow_gap = max(follow_gap - 10, 80)
+          self.params.put_nonblocking("FollowGap", str(follow_gap))
+
           ret.buttonEvents = [structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise)]
         self.distance_button = right_scroll
 
