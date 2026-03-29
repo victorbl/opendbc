@@ -3,7 +3,7 @@ from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.rivian.carcontroller import CarController
 from opendbc.car.rivian.carstate import CarState
 from opendbc.car.rivian.radar_interface import RadarInterface
-from opendbc.car.rivian.values import RivianSafetyFlags
+from opendbc.car.rivian.values import RivianFlags, RivianSafetyFlags
 
 
 class CarInterface(CarInterfaceBase):
@@ -24,10 +24,17 @@ class CarInterface(CarInterfaceBase):
     ret.steerControlType = structs.CarParams.SteerControlType.torque
     ret.radarUnavailable = True
 
-    # TODO: pending finding/handling missing set speed
+    # Detect longitudinal harness upgrade via forwarded park assist messages on bus 1
     ret.alphaLongitudinalAvailable = False
-    if alpha_long:
+    if 0x131a in fingerprint[1]:
+      ret.flags |= RivianFlags.HARNESS_UPGRADE.value
+      ret.alphaLongitudinalAvailable = True
+      ret.radarUnavailable = False
+      ret.enableBsm = True
+
+    if alpha_long and ret.alphaLongitudinalAvailable:
       ret.openpilotLongitudinalControl = True
+      ret.pcmCruise = False
       ret.safetyConfigs[0].safetyParam |= RivianSafetyFlags.LONG_CONTROL.value
 
     ret.longitudinalActuatorDelay = 0.35
