@@ -111,10 +111,13 @@ class CarState(CarStateBase):
         prev_left = self.right_button_left_click
         self.right_button_right_click = cp_park.vl["WheelButtons_Fwd"]["RightButton_RightClick"]
         self.right_button_left_click = cp_park.vl["WheelButtons_Fwd"]["RightButton_LeftClick"]
-        button_events = [
-          *create_button_events(self.right_button_right_click, prev_right, {2: ButtonType.accelCruise}),
-          *create_button_events(self.right_button_left_click, prev_left, {2: ButtonType.decelCruise}),
-        ]
+        # Only generate speed button events when cruise is engaged to prevent
+        # unintentional buttonEnable -> controlsMismatch when stalk is not pulled
+        if ret.cruiseState.enabled:
+          button_events = [
+            *create_button_events(self.right_button_right_click, prev_right, {2: ButtonType.accelCruise}),
+            *create_button_events(self.right_button_left_click, prev_left, {2: ButtonType.decelCruise}),
+          ]
 
         # Scroll wheel -> gapAdjustCruise (selfdrived cycles personality on falling edge)
         cur_scroll = cp_park.vl["WheelButtons_Fwd"]["RightButton_Scroll"]
