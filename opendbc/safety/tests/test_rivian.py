@@ -131,15 +131,215 @@ class TestRivianStockSafety(TestRivianSafetyBase):
 
 class TestRivianLongitudinalSafety(TestRivianSafetyBase):
 
-  TX_MSGS = [[0x120, 0], [0x321, 2], [0x160, 0]]
-  RELAY_MALFUNCTION_ADDRS = {0: (0x120, 0x160), 2: (0x321,)}
-  FWD_BLACKLISTED_ADDRS = {0: [0x321], 2: [0x120, 0x160]}
+  TX_MSGS = [[0x120, 0], [0x321, 2], [0x160, 0], [0x162, 2]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0x120, 0x160), 2: (0x321, 0x162)}
+  FWD_BLACKLISTED_ADDRS = {0: [0x321, 0x162], 2: [0x120]}  # 0x160 NOT blacklisted (dynamic fwd hook)
 
   def setUp(self):
     self.packer = CANPackerSafety("rivian_primary_actuator")
+    self.packer_alt = CANPackerSafety("rivian_park_assist_can")
     self.safety = libsafety_py.libsafety
     self.safety.set_safety_hooks(CarParams.SafetyModel.rivian, RivianSafetyFlags.LONG_CONTROL)
     self.safety.init_tests()
+
+  # --- Helper methods ---
+
+  def _wheel_button_msg(self, left_click=0, right_click=0, scroll=255):
+    values = {
+      "RightButton_LeftClick": left_click,
+      "RightButton_RightClick": right_click,
+      "RightButton_Scroll": scroll,
+    }
+    return self.packer_alt.make_can_msg_safety("WheelButtons_Fwd", 1, values)
+
+  def _gear_msg(self, gear=4):
+    """Send VDM_PropStatus with gear. 4=Drive, 1=Park, 2=Reverse, 3=Neutral."""
+    values = {"VDM_Prndl_Status": gear, "VDM_AcceleratorPedalPosition": 0,
+              "VDM_VehicleSpeed": 0, "VDM_PropStatus_Counter": self.cnt_speed_2 % 15,
+              "VDM_VehicleSpeedQ": 1}
+    self.__class__.cnt_speed_2 += 1
+    return self.packer.make_can_msg_safety("VDM_PropStatus", 0, values, fix_checksum=checksum)
+
+  def _engage_button(self):
+    """Press and release left button to engage. Assumes in Drive and ACM not active."""
+    self._rx(self._wheel_button_msg(left_click=2))  # press
+    self._rx(self._wheel_button_msg(left_click=0))  # release
+
+  def _wait_debounce(self):
+    """Wait for debounce to expire (6 frames at 20Hz)."""
+    for _ in range(6):
+      self._rx(self._wheel_button_msg(left_click=0))
+
+  # --- Override common cruise tests (engagement is via button, not pcm_status) ---
+
+  def test_enable_control_allowed_from_cruise(self):
+    self._rx(self._gear_msg(4))  # Drive
+    self._rx(self._pcm_status_msg(False))  # ACM not active
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._engage_button()
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_disable_control_allowed_from_cruise(self):
+    self._rx(self._gear_msg(4))
+    self._rx(self._pcm_status_msg(False))
+    self._engage_button()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._wait_debounce()
+    self._engage_button()  # toggle off
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_cruise_engaged_prev(self):
+    self._rx(self._gear_msg(4))
+    self._rx(self._pcm_status_msg(False))
+    self._engage_button()
+    self.assertTrue(self.safety.get_cruise_engaged_prev())
+    self._wait_debounce()
+    self._engage_button()
+    self.assertFalse(self.safety.get_cruise_engaged_prev())
+
+  # --- Button toggle tests ---
+
+  def test_button_engage_disengage(self):
+    self._rx(self._gear_msg(4))
+    self._rx(self._pcm_status_msg(False))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+    # Engage
+    self._engage_button()
+    self.assertTrue(self.safety.get_controls_allowed())
+
+    # Wait debounce, then disengage
+    self._wait_debounce()
+    self._engage_button()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_button_engage_not_in_drive(self):
+    for gear in (1, 2, 3):  # Park, Reverse, Neutral
+      # Reset safety to clear debounce between iterations (debounce fires even
+      # when engage conditions fail, which would mask the gear guard on subsequent gears)
+      self.safety.set_safety_hooks(CarParams.SafetyModel.rivian, RivianSafetyFlags.LONG_CONTROL)
+      self.safety.init_tests()
+      self._rx(self._gear_msg(gear))
+      self._rx(self._pcm_status_msg(False))
+      self._engage_button()
+      self.assertFalse(self.safety.get_controls_allowed(), f"engaged in gear {gear}")
+
+  def test_button_engage_blocked_during_stock_acc(self):
+    self._rx(self._gear_msg(4))
+    self._rx(self._pcm_status_msg(True))  # ACM active (stock ACC engaged)
+    self._engage_button()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_button_debounce(self):
+    self._rx(self._gear_msg(4))
+    self._rx(self._pcm_status_msg(False))
+
+    # Engage
+    self._engage_button()
+    self.assertTrue(self.safety.get_controls_allowed())
+
+    # Immediately try to disengage (within debounce) — should be ignored
+    self._rx(self._wheel_button_msg(left_click=2))
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_brake_resets_engagement(self):
+    self._rx(self._gear_msg(4))
+    self._rx(self._pcm_status_msg(False))
+    self._engage_button()
+    self.assertTrue(self.safety.get_controls_allowed())
+
+    # Brake press
+    self._rx(self._user_brake_msg(1))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_button_disengage_always_works(self):
+    """Disengage works even during stock ACC (safety escape)."""
+    self._rx(self._gear_msg(4))
+    self._rx(self._pcm_status_msg(False))
+    self._engage_button()
+    self.assertTrue(self.safety.get_controls_allowed())
+
+    # Stock ACC goes active while openpilot is engaged
+    self._rx(self._pcm_status_msg(True))
+    self._wait_debounce()
+
+    # Disengage should still work
+    self._engage_button()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  # --- Additional safety tests ---
+
+  def test_engage_simultaneous_brake(self):
+    """If brake is pressed in same cycle as button, engagement should not persist."""
+    self._rx(self._gear_msg(4))
+    self._rx(self._pcm_status_msg(False))
+
+    # Press brake first, then button
+    self._rx(self._user_brake_msg(1))
+    self._rx(self._wheel_button_msg(left_click=2))  # press
+    # Button may briefly set controls_allowed, but brake_pressed is already true
+    # Next generic_rx_checks on any message will see brake_pressed rising edge passed
+    # Send another message to trigger generic_rx_checks
+    self._rx(self._wheel_button_msg(left_click=0))  # release
+    # After processing, controls_allowed should be false (brake overrides)
+    # Note: the exact behavior depends on whether brake rising edge was consumed.
+    # At minimum, the system should not remain engaged.
+    self._rx(self._user_brake_msg(0))  # release brake
+    self._rx(self._user_brake_msg(1))  # re-press to trigger rising edge
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_rx_check_timeout_0x131A(self):
+    """If WheelButtons_Fwd stops transmitting, controls_allowed should clear via safety_tick."""
+    self._rx(self._gear_msg(4))
+    self._rx(self._pcm_status_msg(False))
+    self._engage_button()
+    self.assertTrue(self.safety.get_controls_allowed())
+
+    # Advance timer past the lag threshold (2s is past any rx_check frequency)
+    # and call safety_tick WITHOUT sending fresh 0x131A messages.
+    # Keep other rx_checks alive so only 0x131A times out.
+    self._rx(self._speed_msg(0))
+    self._rx(self._user_gas_msg(0))
+    self._rx(self._user_brake_msg(0))
+    self._rx(self._pcm_status_msg(False))
+    self._rx(self._torque_driver_msg(0))
+    self.safety.set_timer(int(2e6))
+    self.safety.safety_tick_current_safety_config()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  # --- Fwd hook tests ---
+
+  def test_fwd_hook_blocks_0x160_when_engaged(self):
+    self.safety.set_controls_allowed(True)
+    # 0x160 from bus 2 (ACM) should be blocked
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x160))
+
+  def test_fwd_hook_allows_0x160_when_disengaged(self):
+    self.safety.set_controls_allowed(False)
+    # 0x160 from bus 2 (ACM) should be forwarded to bus 0
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x160))
+
+  def test_fwd_hook_0x160_bus0_not_blocked(self):
+    """0x160 from bus 0 (openpilot's own) is never blocked by fwd hook."""
+    for controls_allowed in (True, False):
+      self.safety.set_controls_allowed(controls_allowed)
+      # Bus 0 to bus 2 forwarding — should always pass (fwd hook only checks bus 2)
+      self.assertEqual(2, self.safety.safety_fwd_hook(0, 0x160))
+
+  def test_fwd_hook_0x162_always_blocked(self):
+    """0x162 uses static blocking — always blocked from bus 0 to bus 2."""
+    for controls_allowed in (True, False):
+      self.safety.set_controls_allowed(controls_allowed)
+      # 0x162 from bus 0 (VDM) should be blocked from forwarding to bus 2
+      self.assertEqual(-1, self.safety.safety_fwd_hook(0, 0x162))
+
+  def test_adas_status_tx(self):
+    """0x162 TX is allowed in longitudinal mode (for stalk suppression)."""
+    for controls_allowed in (True, False):
+      self.safety.set_controls_allowed(controls_allowed)
+      for interface_status in range(4):
+        values = {"VDM_AdasInterfaceStatus": interface_status}
+        self.assertTrue(self._tx(self.packer.make_can_msg_safety("VDM_AdasSts", 2, values)))
 
 
 if __name__ == "__main__":

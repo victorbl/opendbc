@@ -36,8 +36,30 @@ class CarController(CarControllerBase):
 
     # Longitudinal control
     if self.CP.openpilotLongitudinalControl:
-      accel = float(np.clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
-      can_sends.append(create_longitudinal(self.packer, self.frame, accel, CC.enabled))
+      # Only send 0x160 when engaged — ACM is sole source otherwise (dynamic relay)
+      if CC.enabled:
+        accel = float(np.clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
+        can_sends.append(create_longitudinal(self.packer, self.frame, accel, True))
+
+      # Stalk management via 0x162 (always sent — relay blocks stock 0x162)
+      interface_status = None
+      stalk_override = None
+
+      if CC.enabled:
+        # ENGAGED: suppress stalk so ACM never sees pulls
+        stalk_override = 0  # IDLE
+
+        # Transition cancel: if ACM was active when we engaged
+        if CS.acm_feature_status >= 1:
+          interface_status = 1 if self.cancel_frames < 5 else 0
+          self.cancel_frames += 1
+        else:
+          self.cancel_frames = 0
+      else:
+        # DISENGAGED: forward real stalk values — stock ACC works
+        self.cancel_frames = 0
+
+      can_sends.append(create_adas_status(self.packer, CS.vdm_adas_status, interface_status, stalk_override))
     else:
       interface_status = None
       if CC.cruiseControl.cancel:

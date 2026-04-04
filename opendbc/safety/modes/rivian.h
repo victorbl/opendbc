@@ -2,6 +2,12 @@
 
 #include "opendbc/safety/declarations.h"
 
+static bool rivian_longitudinal = false;
+static bool rivian_left_click_prev = false;
+static uint32_t rivian_left_click_debounce = 0;
+static bool rivian_in_drive = false;
+static bool rivian_acm_engaged = false;
+
 static uint8_t rivian_get_counter(const CANPacket_t *msg) {
   // Signal: ESP_Status_Counter, VDM_PropStatus_Counter
   return msg->data[1] & 0xFU;
@@ -62,9 +68,12 @@ static void rivian_rx_hook(const CANPacket_t *msg) {
       UPDATE_VEHICLE_SPEED(speed * KPH_TO_MS);
     }
 
-    // Gas pressed and second speed source for variable torque limit
+    // Gas pressed, gear, and second speed source for variable torque limit
     if (msg->addr == 0x150U) {
       gas_pressed = msg->data[3] | (msg->data[4] & 0xC0U);
+
+      // VDM_Prndl_Status: 19|4@0+ Motorola = byte[2] bits 3-0, value 4 = Drive
+      rivian_in_drive = (msg->data[2] & 0x0FU) == 4U;
 
       // Disable controls if speeds from VDM and ESP ECUs are too far apart.
       float vdm_speed = ((msg->data[5] << 8) | msg->data[6]) * 0.01 * KPH_TO_MS;
@@ -84,10 +93,40 @@ static void rivian_rx_hook(const CANPacket_t *msg) {
   }
 
   if (msg->bus == 2U) {
-    // Cruise state
+    // Track ACM engagement state (used to block openpilot engagement during stock ACC)
     if (msg->addr == 0x100U) {
-      const int feature_status = msg->data[2] >> 5U;
-      pcm_cruise_check(feature_status == 1);
+      rivian_acm_engaged = (msg->data[2] >> 5U) >= 1U;
+      // Non-longitudinal mode still uses pcm_cruise_check for stock ACC coexistence
+      if (!rivian_longitudinal) {
+        pcm_cruise_check(rivian_acm_engaged);
+      }
+    }
+  }
+
+  if (msg->bus == 1U) {
+    // Left button toggle for openpilot engagement (WheelButtons_Fwd, longitudinal only)
+    if (rivian_longitudinal && (msg->addr == 0x131AU)) {
+      // RightButton_LeftClick: 38|2@1+ Intel = byte[4] bits 7:6, value 2 = pressed
+      bool left_click_pressed = ((msg->data[4] >> 6) & 0x3U) == 2U;
+
+      if (rivian_left_click_debounce > 0U) {
+        rivian_left_click_debounce--;
+      }
+
+      if (left_click_pressed && !rivian_left_click_prev && (rivian_left_click_debounce == 0U)) {
+        if (!controls_allowed && rivian_in_drive && !rivian_acm_engaged) {
+          // Engage — only when in Drive AND stock ACC not active
+          controls_allowed = true;
+          cruise_engaged_prev = true;
+        } else if (controls_allowed) {
+          // Disengage
+          controls_allowed = false;
+          cruise_engaged_prev = false;
+        }
+        rivian_left_click_debounce = 6U;  // ~300ms at 20Hz
+      }
+
+      rivian_left_click_prev = left_click_pressed;
     }
   }
 }
@@ -140,13 +179,29 @@ static bool rivian_tx_hook(const CANPacket_t *msg) {
   return tx;
 }
 
+static bool rivian_fwd_hook(int bus_num, int addr) {
+  bool block = false;
+  if (bus_num == 2) {
+    // Block ACM's longitudinal commands only when openpilot is engaged
+    if ((addr == 0x160U) && controls_allowed) {
+      block = true;
+    }
+  }
+  return block;
+}
+
 static safety_config rivian_init(uint16_t param) {
   // SCCM_WheelTouch: for hiding hold wheel alert
   // VDM_AdasSts: for canceling stock ACC
   // 0x120 = ACM_lkaHbaCmd, 0x321 = SCCM_WheelTouch, 0x162 = VDM_AdasSts
   static const CanMsg RIVIAN_TX_MSGS[] = {{0x120, 0, 8, .check_relay = true}, {0x321, 2, 7, .check_relay = true}, {0x162, 2, 8, .check_relay = true}};
-  // 0x160 = ACM_longitudinalRequest
-  static const CanMsg RIVIAN_LONG_TX_MSGS[] = {{0x120, 0, 8, .check_relay = true}, {0x321, 2, 7, .check_relay = true}, {0x160, 0, 5, .check_relay = true}};
+  // 0x160 = ACM_longitudinalRequest (dynamic blocking via fwd hook), 0x162 = VDM_AdasSts (stalk suppression)
+  static const CanMsg RIVIAN_LONG_TX_MSGS[] = {
+    {0x120, 0, 8, .check_relay = true},
+    {0x321, 2, 7, .check_relay = true},
+    {0x160, 0, 5, .check_relay = true, .disable_static_blocking = true},
+    {0x162, 2, 8, .check_relay = true},
+  };
 
   static RxCheck rivian_rx_checks[] = {
     {.msg = {{0x208, 0, 8, 50U, .max_counter = 14U}, { 0 }, { 0 }}},                                                             // ESP_Status (speed)
@@ -156,7 +211,16 @@ static safety_config rivian_init(uint16_t param) {
     {.msg = {{0x100, 2, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // ACM_Status (cruise state)
   };
 
-  bool rivian_longitudinal = false;
+  static RxCheck rivian_long_rx_checks[] = {
+    {.msg = {{0x208, 0, 8, 50U, .max_counter = 14U}, { 0 }, { 0 }}},                                                             // ESP_Status (speed)
+    {.msg = {{0x150, 0, 7, 50U, .max_counter = 14U}, { 0 }, { 0 }}},                                                             // VDM_PropStatus (gas pedal & 2nd speed)
+    {.msg = {{0x380, 0, 5, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // EPAS_SystemStatus (driver torque)
+    {.msg = {{0x38f, 0, 6, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},   // iBESP2 (brakes)
+    {.msg = {{0x100, 2, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // ACM_Status (cruise state)
+    {.msg = {{0x131A, 1, 7, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // WheelButtons_Fwd (left click)
+  };
+
+  rivian_longitudinal = false;
 
   SAFETY_UNUSED(param);
   #ifdef ALLOW_DEBUG
@@ -164,10 +228,14 @@ static safety_config rivian_init(uint16_t param) {
     rivian_longitudinal = GET_FLAG(param, FLAG_RIVIAN_LONG_CONTROL);
   #endif
 
-  // FIXME: cppcheck thinks that rivian_longitudinal is always false. This is not true
-  // if ALLOW_DEBUG is defined but cppcheck is run without ALLOW_DEBUG
+  // Reset button engagement statics
+  rivian_left_click_prev = false;
+  rivian_left_click_debounce = 0;
+  rivian_in_drive = false;
+  rivian_acm_engaged = false;
+
   // cppcheck-suppress knownConditionTrueFalse
-  return rivian_longitudinal ? BUILD_SAFETY_CFG(rivian_rx_checks, RIVIAN_LONG_TX_MSGS) : \
+  return rivian_longitudinal ? BUILD_SAFETY_CFG(rivian_long_rx_checks, RIVIAN_LONG_TX_MSGS) : \
                                BUILD_SAFETY_CFG(rivian_rx_checks, RIVIAN_TX_MSGS);
 }
 
@@ -175,6 +243,7 @@ const safety_hooks rivian_hooks = {
   .init = rivian_init,
   .rx = rivian_rx_hook,
   .tx = rivian_tx_hook,
+  .fwd = rivian_fwd_hook,
   .get_counter = rivian_get_counter,
   .get_checksum = rivian_get_checksum,
   .compute_checksum = rivian_compute_checksum,

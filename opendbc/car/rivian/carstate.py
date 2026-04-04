@@ -1,6 +1,6 @@
 import copy
 from opendbc.can import CANParser
-from opendbc.car import Bus, create_button_events, structs
+from opendbc.car import Bus, structs
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.rivian.values import DBC, GEAR_MAP, RivianFlags
 from opendbc.car.common.conversions import Conversions as CV
@@ -19,11 +19,15 @@ class CarState(CarStateBase):
     self.sccm_wheel_touch: dict | None = None
     self.vdm_adas_status: dict | None = None
 
-    # Wheel button state tracking (harness upgrade)
+    # Button engagement state (left click toggle)
+    self._button_engaged = False
+    self._left_click_prev = 0
+    self._left_click_debounce = 0  # mirror panda's 6-frame debounce
+    self._prev_scroll_position = 255  # for scroll direction detection
     self.right_button_right_click = 0
-    self.right_button_left_click = 0
-    self.right_button_scroll = 255  # 255 = idle
-    self.cruise_enabled_prev = False
+
+    # ACM feature status for engagement guard + carcontroller transition cancel
+    self.acm_feature_status = 0
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -56,7 +60,11 @@ class CarState(CarStateBase):
     # Cruise state
     speed = min(int(cp_adas.vl["ACM_tsrCmd"]["ACM_tsrSpdDisClsMain"]), 85)
     self.last_speed = speed if speed != 0 else self.last_speed
-    ret.cruiseState.enabled = cp_cam.vl["ACM_Status"]["ACM_FeatureStatus"] == 1
+    self.acm_feature_status = cp_cam.vl["ACM_Status"]["ACM_FeatureStatus"]
+    # cruiseState.enabled is set after button logic below (when longitudinal)
+    # For non-longitudinal mode, use ACM status directly
+    if not self.CP.openpilotLongitudinalControl:
+      ret.cruiseState.enabled = self.acm_feature_status == 1
     # TODO: find cruise set speed on CAN
     ret.cruiseState.speed = self.last_speed * CV.MPH_TO_MS  # detected speed limit
     ret.cruiseState.available = True  # cp.vl["VDM_AdasSts"]["VDM_AdasInterfaceStatus"] == 1
@@ -101,34 +109,60 @@ class CarState(CarStateBase):
       cp_park = can_parsers[Bus.alt]
 
       if self.CP.openpilotLongitudinalControl:
-        # Right wheel buttons -> accelCruise / decelCruise for VCruiseHelper
-        prev_right = self.right_button_right_click
-        prev_left = self.right_button_left_click
-        self.right_button_right_click = cp_park.vl["WheelButtons_Fwd"]["RightButton_RightClick"]
-        self.right_button_left_click = cp_park.vl["WheelButtons_Fwd"]["RightButton_LeftClick"]
-        # Only generate speed button events when cruise is engaged to prevent
-        # unintentional buttonEnable -> controlsMismatch when stalk is not pulled
-        if ret.cruiseState.enabled:
-          button_events = [
-            *create_button_events(self.right_button_right_click, prev_right, {2: ButtonType.accelCruise}),
-            *create_button_events(self.right_button_left_click, prev_left, {2: ButtonType.decelCruise}),
-          ]
+        # --- Left button: engage/disengage toggle ---
+        cur_left = cp_park.vl["WheelButtons_Fwd"]["RightButton_LeftClick"]
 
-        # Scroll wheel -> gapAdjustCruise (selfdrived cycles personality on falling edge)
+        # Mirror panda's 6-frame debounce (~300ms at 20Hz)
+        if self._left_click_debounce > 0:
+          self._left_click_debounce -= 1
+
+        left_rising = (cur_left == 2) and (self._left_click_prev != 2) and (self._left_click_debounce == 0)
+        self._left_click_prev = cur_left
+
+        # Reset on brake BEFORE toggle logic
+        if ret.brakePressed:
+          self._button_engaged = False
+
+        if left_rising:
+          if (not self._button_engaged
+              and ret.gearShifter == GearShifter.drive
+              and self.acm_feature_status == 0):
+            # Engage — only when in Drive AND stock ACC not active
+            self._button_engaged = True
+            button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.decelCruise))
+            self._left_click_debounce = 6
+          elif self._button_engaged:
+            # Disengage
+            self._button_engaged = False
+            button_events.append(structs.CarState.ButtonEvent(pressed=True, type=ButtonType.cancel))
+            self._left_click_debounce = 6
+
+        # Set cruiseState.enabled AFTER toggle + brake reset
+        ret.cruiseState.enabled = self._button_engaged
+
+        # --- Scroll wheel: speed adjustment (only when OP engaged, not on engagement frame) ---
         cur_scroll = cp_park.vl["WheelButtons_Fwd"]["RightButton_Scroll"]
-        if cur_scroll != 255 and self.right_button_scroll != 255 and cur_scroll != self.right_button_scroll:
+
+        if self._button_engaged and not left_rising and cur_scroll != 255 and self._prev_scroll_position != 255:
+          delta = cur_scroll - self._prev_scroll_position
+          if delta != 0:
+            if delta > 127:
+              delta -= 255
+            elif delta < -127:
+              delta += 255
+            if delta > 0:
+              button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.accelCruise))
+            elif delta < 0:
+              button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.decelCruise))
+
+        if cur_scroll != 255:
+          self._prev_scroll_position = cur_scroll
+
+        # --- Right button: cycle driving personality ---
+        prev_right = self.right_button_right_click
+        self.right_button_right_click = cp_park.vl["WheelButtons_Fwd"]["RightButton_RightClick"]
+        if prev_right == 2 and self.right_button_right_click != 2:
           button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise))
-        self.right_button_scroll = cur_scroll
-
-        # Stalk engage -> synthetic decelCruise to trigger buttonEnable via update_button_enable
-        # Uses decelCruise (not accelCruise) to avoid resumeBlocked NO_ENTRY when vCruise is UNSET
-        if ret.cruiseState.enabled and not self.cruise_enabled_prev:
-          button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.decelCruise))
-
-        # Stalk disengage -> cancel (falling edge of cruiseState.enabled)
-        if not ret.cruiseState.enabled and self.cruise_enabled_prev:
-          button_events.append(structs.CarState.ButtonEvent(pressed=True, type=ButtonType.cancel))
-        self.cruise_enabled_prev = ret.cruiseState.enabled
 
       # BSM from park assist bus
       if self.CP.enableBsm:
